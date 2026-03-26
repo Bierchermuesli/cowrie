@@ -13,7 +13,7 @@ from twisted.internet.defer import Deferred, inlineCallbacks
 from twisted.internet.endpoints import HostnameEndpoint
 from twisted.python import failure as tw_failure
 from twisted.python import log
-from twisted.web.client import Agent, HTTPConnectionPool, ProxyAgent, _HTTP11ClientFactory
+from twisted.web.client import Agent, BrowserLikePolicyForHTTPS, HTTPConnectionPool, ProxyAgent, _HTTP11ClientFactory
 from twisted.web.http_headers import Headers
 from twisted.web.iweb import IBodyProducer, IResponse
 from zope.interface import implementer
@@ -96,11 +96,16 @@ class LLMClient:
             or os.environ.get("http_proxy")
             or os.environ.get("HTTP_PROXY")
         )
-        log.msg(f"LLM proxy env: https_proxy={os.environ.get('https_proxy')} HTTPS_PROXY={os.environ.get('HTTPS_PROXY')}")
+        log.msg(f"LLM proxy env: https_proxy={os.environ.get('https_proxy')} HTTPS_PROXY={os.environ.get('HTTPS_PROXY')}, http_proxy={os.environ.get('http_proxy')} HTTP_PROXY={os.environ.get('HTTP_PROXY')}")
         if proxy_url:
             parsed = urllib.parse.urlparse(proxy_url)
             proxy_endpoint = HostnameEndpoint(reactor, parsed.hostname, parsed.port or 8080)
-            self.agent = ProxyAgent(proxy_endpoint, reactor, pool=self._conn_pool)
+            self.agent = ProxyAgent(
+                proxy_endpoint,
+                reactor,
+                pool=self._conn_pool,
+                contextFactory=BrowserLikePolicyForHTTPS(),
+            )
             log.msg(f"LLM using proxy: {parsed.hostname}:{parsed.port}")
         else:
             log.msg("LLM no proxy configured, connecting directly")
