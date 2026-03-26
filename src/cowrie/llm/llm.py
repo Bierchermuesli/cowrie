@@ -4,19 +4,14 @@
 from __future__ import annotations
 
 import json
-import os
-import urllib.parse
 from typing import TYPE_CHECKING, Any
 
-from twisted.internet import defer, protocol, reactor
+import requests
+
+from twisted.internet import defer, reactor
 from twisted.internet.defer import Deferred, inlineCallbacks
-from twisted.internet.endpoints import HostnameEndpoint
-from twisted.python import failure as tw_failure
+from twisted.internet.threads import deferToThread
 from twisted.python import log
-from twisted.web.client import Agent, BrowserLikePolicyForHTTPS, HTTPConnectionPool, ProxyAgent, _HTTP11ClientFactory
-from twisted.web.http_headers import Headers
-from twisted.web.iweb import IBodyProducer, IResponse
-from zope.interface import implementer
 
 from cowrie.core.config import CowrieConfig
 
@@ -24,64 +19,13 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 
-@implementer(IBodyProducer)
-class StringProducer:
-    """
-    Feeds a request body to the HTTP client.
-    """
-
-    def __init__(self, body: str) -> None:
-        self.body = body.encode("utf-8")
-        self.length = len(self.body)
-
-    def startProducing(self, consumer):
-        consumer.write(self.body)
-        return defer.succeed(None)
-
-    def pauseProducing(self) -> None:
-        pass
-
-    def resumeProducing(self) -> None:
-        pass
-
-    def stopProducing(self) -> None:
-        pass
-
-
-class SimpleResponseReceiver(protocol.Protocol):
-    """
-    Collects the response body from an HTTP response.
-    """
-
-    def __init__(self, status_code: int, d: defer.Deferred) -> None:
-        self.status_code = status_code
-        self.buf = b""
-        self.d = d
-
-    def dataReceived(self, data: bytes) -> None:
-        self.buf += data
-
-    def connectionLost(self, reason: tw_failure.Failure = protocol.connectionDone) -> None:
-        self.d.callback((self.status_code, self.buf))
-
-
-class QuietHTTP11ClientFactory(_HTTP11ClientFactory):
-    """
-    Silences factory start/stop log messages.
-    """
-
-    noisy = False
-
-
 class LLMClient:
     """
     Client for communicating with OpenAI-compatible LLM APIs.
+    Uses requests via deferToThread so proxy env vars (HTTPS_PROXY etc.) work correctly.
     """
 
     def __init__(self) -> None:
-        self._conn_pool = HTTPConnectionPool(reactor)
-        self._conn_pool._factory = QuietHTTP11ClientFactory
-
         self.api_key = CowrieConfig.get("llm", "api_key", fallback="")
         self.model = CowrieConfig.get("llm", "model", fallback="gpt-4o-mini")
         self.host = CowrieConfig.get("llm", "host", fallback="https://api.openai.com")
@@ -90,45 +34,22 @@ class LLMClient:
         self.temperature = CowrieConfig.getfloat("llm", "temperature", fallback=0.7)
         self.debug = CowrieConfig.getboolean("llm", "debug", fallback=False)
 
-        proxy_url = (
-            os.environ.get("https_proxy")
-            or os.environ.get("HTTPS_PROXY")
-            or os.environ.get("http_proxy")
-            or os.environ.get("HTTP_PROXY")
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            }
         )
-        log.msg(f"LLM proxy env: https_proxy={os.environ.get('https_proxy')} HTTPS_PROXY={os.environ.get('HTTPS_PROXY')}, http_proxy={os.environ.get('http_proxy')} HTTP_PROXY={os.environ.get('HTTP_PROXY')}")
-        if proxy_url:
-            parsed = urllib.parse.urlparse(proxy_url)
-            proxy_endpoint = HostnameEndpoint(reactor, parsed.hostname, parsed.port or 8080)
-            self.agent = ProxyAgent(
-                proxy_endpoint,
-                reactor,
-                pool=self._conn_pool,
-                contextFactory=BrowserLikePolicyForHTTPS(),
-            )
-            log.msg(f"LLM using proxy: {parsed.hostname}:{parsed.port}")
-        else:
-            log.msg("LLM no proxy configured, connecting directly")
-            self.agent = Agent(reactor, pool=self._conn_pool)
 
         if not self.api_key:
             log.msg("WARNING: No LLM API key configured in [llm] section")
-
-    def _build_headers(self) -> Headers:
-        """Build HTTP headers with authentication."""
-        return Headers(
-            {
-                b"Content-Type": [b"application/json"],
-                b"Authorization": [f"Bearer {self.api_key}".encode()],
-            }
-        )
 
     def _format_request_body(self, prompt: list[str]) -> dict:
         """Structure the request body for OpenAI chat completions API."""
         messages = []
         for i, message in enumerate(prompt):
             if i == 0:
-                # First message is our system prompt
                 messages.append({"role": "system", "content": message})
             elif message.startswith("User:"):
                 content = message[5:].strip()
@@ -146,36 +67,23 @@ class LLMClient:
             "temperature": self.temperature,
         }
 
-    def _handle_response_body(self, response: IResponse) -> Deferred[tuple[int, bytes]]:
-        """Extract the response body from the HTTP response."""
-        d: Deferred[tuple[int, bytes]] = defer.Deferred()
-        response.deliverBody(SimpleResponseReceiver(response.code, d))
-        return d
-
-    def _handle_connection_error(
-        self, err: tw_failure.Failure
-    ) -> tuple[int, bytes]:
-        """Handle connection errors."""
-        err.trap(Exception)
-        return (500, err.getErrorMessage().encode("utf-8"))
-
-    def _send_request(self, prompt: list[str]) -> Deferred[tuple[int, bytes]]:
-        """Send request to the LLM API."""
+    def _do_request(self, prompt: list[str]) -> tuple[int, bytes]:
+        """Blocking HTTP request — runs in a thread via deferToThread."""
         request_body = self._format_request_body(prompt)
 
         if self.debug:
             log.msg(f"LLM request: {json.dumps(request_body, indent=2)}")
 
         url = f"{self.host}{self.path}"
-        d: Deferred[Any] = self.agent.request(
-            b"POST",
-            url.encode("utf-8"),
-            headers=self._build_headers(),
-            bodyProducer=StringProducer(json.dumps(request_body)),
-        )
+        try:
+            response = self._session.post(url, json=request_body, timeout=30)
+            return response.status_code, response.content
+        except Exception as e:
+            return 500, str(e).encode("utf-8")
 
-        d.addCallbacks(self._handle_response_body, self._handle_connection_error)
-        return d
+    def _send_request(self, prompt: list[str]) -> Deferred[tuple[int, bytes]]:
+        """Send request to the LLM API asynchronously."""
+        return deferToThread(self._do_request, prompt)
 
     @inlineCallbacks
     def get_response(
